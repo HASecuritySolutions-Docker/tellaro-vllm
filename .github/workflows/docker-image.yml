@@ -1,0 +1,81 @@
+name: Build
+
+# Controls when the workflow will run
+on:
+  push:
+    branches:
+      - 'main'
+      - 'dev'
+    tags:
+      - '*'
+  pull_request:
+    branches:
+      - 'main'
+      - 'dev'
+
+# permissions are needed if pushing to ghcr.io
+permissions: 
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # Get the repository's code
+      - name: Checkout
+        uses: actions/checkout@v6
+      # https://github.com/docker/setup-buildx-action
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Login to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Docker meta
+        id: prep # you'll use this in the next step
+        uses: docker/metadata-action@v6
+        with:
+          # list of Docker images to use as base name for tags
+          images: |
+            hasecuritysolutions/tellaro-vllm
+          # Docker tags based on the following events/attributes
+          tags: |
+            type=schedule
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.prep.outputs.tags }}
+          labels: ${{ steps.prep.outputs.labels }}
+      # Publish the digest: B4 pins runs to it (image@sha256:...), not to a tag.
+      - name: Publish digest
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.prep.outputs.tags }}
+        run: |
+          echo "hasecuritysolutions/tellaro-vllm@${DIGEST}"
+          {
+            echo "### hasecuritysolutions/tellaro-vllm"
+            echo
+            echo "Digest: \`${DIGEST}\`"
+            echo
+            echo "Pull: \`hasecuritysolutions/tellaro-vllm@${DIGEST}\`"
+            echo
+            echo "Tags:"
+            echo '```'
+            echo "${TAGS}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

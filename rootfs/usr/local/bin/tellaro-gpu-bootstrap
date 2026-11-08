@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""tellaro-gpu-bootstrap: key pair, bootstrap redemption, renewal and health.
+
+Design: tellaro-docs internal/platform/runpod-gpu-pools.md sections 3.3 and 3.4.
+
+Subcommands
+  keygen   P-256 key (mode 0600, container disk only) and a CSR.        [done]
+  redeem   POST /api/v1/gpu_pool/bootstrap, unseal, write files.        [STUB]
+  serve    loopback helper behind Caddy for /_tellaro/{health,renew}.   [health done, renew STUB]
+
+############################################################################
+# STUB: the bootstrap client is NOT implemented yet.
+#
+# The request/response JSON of POST /api/v1/gpu_pool/bootstrap and
+# POST /_tellaro/renew, the seal_v2 raw-key decryption and the launch-profile
+# shape are fixed by tellaro-backend#3047 (B3). Field names are deliberately
+# not guessed here. Until B3 merges, `redeem` exits 78 and the container
+# stops before anything listens, and `/_tellaro/renew` answers 501.
+#
+# Files `redeem` must write (the entrypoint's contract, internal to this image):
+#   <tls-dir>/server.crt          server chain from the backend
+#   <tls-dir>/client-ca.pem       GPU pool CA bundle (current + previous)
+#   <secrets-dir>/vllm-api-key    unsealed vLLM API key
+#   <secrets-dir>/hf-token        unsealed HF token, only if the model needs one
+#   <launch-dir>/vllm-args.json   JSON list of `vllm serve` args from the profile,
+#                                 after check_profile_args()
+############################################################################
+"""
+
+from __future__ import annotations
+
+import argparse
+import http.server
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+EX_CONFIG = 78  # sysexits: "not configured" - the stub's exit code
+
+# Flags a launch profile may never pass: they would move vLLM off loopback,
+# replace the API key, or turn on request/output logging.
+DENIED_FLAG_PREFIXES = (
+    "--host",
+    "--port",
+    "--uds",
+    "--api-key",
+    "--enable-log-requests",
+    "--enable-log-outputs",
+    "--log-config-file",
+    "--ssl-",
+    "--allowed-origins",
+    "--root-path",
+)
+
+
+def log(msg: str) -> None:
+    print(f"tellaro-gpu-bootstrap: {msg}", file=sys.stderr, flush=True)
+
+
+def write_private(path: str, data: bytes) -> None:
+    """Write a file readable only by this uid, never via a world-readable temp."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    os.chmod(path, 0o600)
+
+
+def check_profile_args(args: list[str]) -> list[str]:
+    """Reject launch-profile args that would weaken the image's fixed settings."""
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        raise ValueError("launch profile args must be a list of strings")
+    for a in args:
+        flag = a.split("=", 1)[0]
+        if any(flag.startswith(p) for p in DENIED_FLAG_PREFIXES):
+            raise ValueError(f"launch profile may not set {flag}")
+    return args
+
+
+# --------------------------------------------------------------------------
+# keygen
+# --------------------------------------------------------------------------
+def cmd_keygen(ns: argparse.Namespace) -> int:
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    run_id = os.environ.get("TELLARO_RUN_ID", "")
+    if not run_id:
+        log("TELLARO_RUN_ID is not set")
+        return 1
+    key = ec.generate_private_key(ec.SECP256R1())
+    write_private(
+        os.path.join(ns.out, "server.key"),
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ),
+    )
+    # The backend sets the SANs itself and ignores the CSR's (section 3.3,
+    # step 4), so the CSR carries only a subject for the audit trail.
+    csr = (
+        x509.CertificateSigningRequestBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, run_id)]))
+        .sign(key, hashes.SHA256())
+    )
+    write_private(os.path.join(ns.out, "server.csr"), csr.public_bytes(serialization.Encoding.PEM))
+    log("generated P-256 key and CSR")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# redeem  (STUB - B3, tellaro-backend#3047)
+# --------------------------------------------------------------------------
+def cmd_redeem(ns: argparse.Namespace) -> int:
+    # STUB(B3): build the bootstrap request from TELLARO_RUN_ID,
+    # TELLARO_BOOTSTRAP_TOKEN and <tls-dir>/server.csr; POST it to
+    # TELLARO_BOOTSTRAP_URL with normal public-TLS verification; retry 425
+    # with backoff (30 min token TTL); unseal the secret part with
+    # <tls-dir>/server.key (seal_v2 raw-key entry point); run
+    # check_profile_args() on the profile; write the files listed in the
+    # module docstring with write_private().
+    log("STUB: bootstrap redemption is not implemented until tellaro-backend#3047 (B3) fixes the wire contract")
+    return EX_CONFIG
+
+
+# --------------------------------------------------------------------------
+# serve  (/_tellaro/health done; /_tellaro/renew STUB)
+# --------------------------------------------------------------------------
+class Handler(http.server.BaseHTTPRequestHandler):
+    vllm_base = "http://127.0.0.1:8000"
+    server_version = "tellaro-gpu-bootstrap"
+    sys_version = ""
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        pass  # no access log
+
+    def _send(self, code: int, body: dict) -> None:
+        data = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path != "/_tellaro/health":
+            self._send(404, {"error": "not found"})
+            return
+        try:
+            with urllib.request.urlopen(f"{self.vllm_base}/health", timeout=5) as r:
+                ok = r.status == 200
+        except (urllib.error.URLError, OSError):
+            ok = False
+        self._send(200 if ok else 503, {"vllm": "up" if ok else "down"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path == "/_tellaro/renew":
+            # STUB(B3): new key + CSR, return it; accept the pushed chain and
+            # client-CA bundle; reload Caddy via the admin unix socket.
+            self._send(501, {"error": "renew not implemented until tellaro-backend#3047"})
+            return
+        self._send(404, {"error": "not found"})
+
+
+def cmd_serve(ns: argparse.Namespace) -> int:
+    host, _, port = ns.listen.rpartition(":")
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        log("refusing to listen off loopback")
+        return 1
+    Handler.vllm_base = ns.vllm.rstrip("/")
+    srv = http.server.ThreadingHTTPServer((host, int(port)), Handler)
+    log(f"helper listening on {ns.listen}")
+    srv.serve_forever()
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="tellaro-gpu-bootstrap")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    k = sub.add_parser("keygen")
+    k.add_argument("--out", required=True)
+    r = sub.add_parser("redeem")
+    r.add_argument("--tls-dir", required=True)
+    r.add_argument("--secrets-dir", required=True)
+    r.add_argument("--launch-dir", required=True)
+    s = sub.add_parser("serve")
+    s.add_argument("--listen", default="127.0.0.1:8001")
+    s.add_argument("--vllm", default="http://127.0.0.1:8000")
+    s.add_argument("--tls-dir", required=True)
+    ns = p.parse_args(argv)
+    return {"keygen": cmd_keygen, "redeem": cmd_redeem, "serve": cmd_serve}[ns.cmd](ns)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

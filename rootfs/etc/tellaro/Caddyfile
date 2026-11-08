@@ -1,0 +1,48 @@
+# mTLS front for tellaro-vllm (runpod-gpu-pools.md sections 2.1, 3.3, 3.4).
+#
+# Fixed and versioned in the image; the backend never templates it. The only
+# runtime inputs are the three PEM files that tellaro-gpu-bootstrap writes:
+#   server.crt / server.key  server leaf signed by the GPU pool CA (SANs set by the backend)
+#   client-ca.pem            GPU pool CA bundle (current + previous) that signs the backend client leaf
+#
+# Every request, /_tellaro/* included, must present a client cert that chains to
+# client-ca.pem. There is no plain-HTTP listener and no fallback.
+{
+	# Admin API only on a private unix socket, used by the bootstrap helper to
+	# reload after a renewal push (section 3.4). Never on TCP.
+	admin unix//run/tellaro/caddy-admin.sock
+	persist_config off
+	auto_https off
+	# No access log is configured for the site below, so request lines (and
+	# prompts in URLs) are never written. Caddy's own log: warnings only.
+	log default {
+		output stderr
+		level WARN
+	}
+	servers {
+		protocols h1 h2
+	}
+}
+
+:8443 {
+	tls /run/tellaro/tls/server.crt /run/tellaro/tls/server.key {
+		protocols tls1.3
+		client_auth {
+			mode require_and_verify
+			trust_pool file /run/tellaro/tls/client-ca.pem
+		}
+	}
+
+	# Renewal and health for the bootstrap helper (loopback only).
+	handle /_tellaro/* {
+		reverse_proxy 127.0.0.1:8001
+	}
+
+	# Everything else goes to vLLM's OpenAI API (loopback only). Streamed
+	# completions are flushed immediately.
+	handle {
+		reverse_proxy 127.0.0.1:8000 {
+			flush_interval -1
+		}
+	}
+}
