@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# tellaro-vllm entrypoint (runpod-gpu-pools.md section 3.3, steps 2 and 6).
+#
+#   1. key pair + CSR, in the container only (tellaro-gpu-bootstrap keygen)
+#   2. redeem the single-use token for certs, secrets and the launch profile
+#      (tellaro-gpu-bootstrap redeem)  <-- STUB until tellaro-backend#3047 (B3)
+#   3. start the bootstrap helper (127.0.0.1:8001), vLLM (127.0.0.1:8000), then
+#      Caddy (:8443, mTLS). If any of them exits, the container exits, and the
+#      backend's reconcile loop replaces the run.
+set -Eeuo pipefail
+umask 077
+
+readonly STATE=/run/tellaro
+readonly TLS_DIR="$STATE/tls"
+readonly SECRETS_DIR="$STATE/secrets"
+readonly LAUNCH_DIR="$STATE/launch"
+readonly VLLM_HOST=127.0.0.1
+readonly VLLM_PORT=8000
+
+log() { printf '%s tellaro-entrypoint: %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
+die() { log "fatal: $*"; exit 1; }
+
+for var in TELLARO_BOOTSTRAP_URL TELLARO_RUN_ID TELLARO_BOOTSTRAP_TOKEN; do
+	[[ -n "${!var:-}" ]] || die "$var is not set"
+done
+mkdir -p "$TLS_DIR" "$SECRETS_DIR" "$LAUNCH_DIR"
+
+tellaro-gpu-bootstrap keygen --out "$TLS_DIR"
+# Retries 425 with backoff; writes server.crt, client-ca.pem, secrets/* and
+# launch/vllm-args.json, or exits non-zero.
+tellaro-gpu-bootstrap redeem --tls-dir "$TLS_DIR" --secrets-dir "$SECRETS_DIR" --launch-dir "$LAUNCH_DIR"
+# The token is single-use and spent now; nothing started below inherits it.
+unset TELLARO_BOOTSTRAP_TOKEN
+
+for f in "$TLS_DIR/server.crt" "$TLS_DIR/server.key" "$TLS_DIR/client-ca.pem" \
+	"$SECRETS_DIR/vllm-api-key" "$LAUNCH_DIR/vllm-args.json"; do
+	[[ -s "$f" ]] || die "bootstrap did not produce $f"
+done
+
+# Profile arguments (model, parallelism, context length...) as a JSON list,
+# checked against a deny-list by the bootstrap helper when it wrote the file.
+mapfile -d '' -t profile_args < <(python3 -c \
+	'import json,sys; sys.stdout.write("".join(a + "\0" for a in json.load(open(sys.argv[1]))))' \
+	"$LAUNCH_DIR/vllm-args.json")
+
+pids=()
+stop_all() {
+	trap - TERM INT
+	for pid in "${pids[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
+	wait || true
+}
+trap 'stop_all; exit 143' TERM INT
+
+tellaro-gpu-bootstrap serve --listen 127.0.0.1:8001 --vllm "http://$VLLM_HOST:$VLLM_PORT" \
+	--tls-dir "$TLS_DIR" &
+pids+=("$!")
+
+# The fixed flags come last so a profile cannot move vLLM off loopback.
+# The API key and HF token reach vLLM through its environment only.
+(
+	VLLM_API_KEY="$(<"$SECRETS_DIR/vllm-api-key")"
+	export VLLM_API_KEY
+	if [[ -s "$SECRETS_DIR/hf-token" ]]; then
+		HF_TOKEN="$(<"$SECRETS_DIR/hf-token")"
+		export HF_TOKEN
+	fi
+	exec vllm serve "${profile_args[@]}" \
+		--host "$VLLM_HOST" --port "$VLLM_PORT" \
+		--disable-log-stats --disable-uvicorn-access-log
+) &
+pids+=("$!")
+
+caddy run --config /etc/tellaro/Caddyfile --adapter caddyfile &
+pids+=("$!")
+
+log "started helper, vLLM and Caddy (run ${TELLARO_RUN_ID})"
+set +e
+wait -n "${pids[@]}"
+rc=$?
+set -e
+log "a child exited (rc=$rc); stopping the rest"
+stop_all
+exit "$rc"
