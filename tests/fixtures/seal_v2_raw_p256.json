@@ -1,0 +1,8 @@
+{
+  "source": "tellaro-backend src/customer_portal/api/seal_v2.py seal_to_key (B3, be#3137)",
+  "note": "test-only key (fixed scalar)",
+  "private_scalar_hex": "000000000000000000000000000000005eed0001c1c100000000000000000042",
+  "binding": "6f1c2a3b4d5e4f60a1b2c3d4e5f60718",
+  "plaintext": "tgp_example-vllm-api-key",
+  "sealed": "s2$AqFGbbW9zmDiKGmTWObiYq+CWXKJwjTSI2mgCS9C7qZoAAECAwQFBgcICQoLEdFUKJBCDiYDKTNAlfNqb3ozMk66txB+1RK4SS947UkD/vNkOAGFww=="
+}
