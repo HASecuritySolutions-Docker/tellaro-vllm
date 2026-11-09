@@ -22,11 +22,16 @@ expect() { # label want-rc want-pattern cmd...
 	if [[ $rc == "$want" ]] && grep -qE -- "$pat" <<<"$out"; then echo "ok   $label"
 	else echo "FAIL $label (rc=$rc)"; tail -5 <<<"$out"; fail=1; fi
 }
-env=(-e TELLARO_BOOTSTRAP_URL=https://example.invalid -e TELLARO_RUN_ID=00000000-0000-4000-8000-000000000001 -e TELLARO_BOOTSTRAP_TOKEN=x)
+env=(-e TELLARO_BOOTSTRAP_URL=http://example.invalid -e TELLARO_RUN_ID=00000000-0000-4000-8000-000000000001 -e TELLARO_BOOTSTRAP_TOKEN=x)
 expect "no env: refuses to start"      1  'TELLARO_BOOTSTRAP_URL is not set' docker run --rm "$img"
-expect "stub redeem stops the start"   78 'STUB: bootstrap redemption'       docker run --rm "${env[@]}" "$img"
+expect "non-https bootstrap refused"   78 'must be https'                     docker run --rm "${env[@]}" "$img"
 expect "keygen writes a 0600 key"      0  '^600 10001'                        docker run --rm "${env[@]}" --entrypoint bash "$img" -c \
 	'tellaro-gpu-bootstrap keygen --out /run/tellaro >/dev/null 2>&1 && stat -c "%a %u" /run/tellaro/server.key'
+# The redeem/renew tests against the image's own Python and cryptography.
+expect "bootstrap tests in image"      0  '^OK$'                              docker run --rm -v "$PWD/tests:/tests:ro" \
+	-e BOOTSTRAP=/usr/local/bin/tellaro-gpu-bootstrap --entrypoint python3 "$img" /tests/bootstrap_test.py
+# The helper reloads Caddy with `reload --force` after a renewal push.
+expect "caddy reload --force exists"   0  '--force'                           docker run --rm --entrypoint caddy "$img" reload --help
 expect "runs as 10001"                 0  '^uid=10001'                        docker run --rm --entrypoint id "$img"
 expect "caddy pinned"                  0  '^v2\.11\.9'                        docker run --rm --entrypoint caddy "$img" version
 # Full `caddy validate` (needs certs) runs in tests/mtls-guard.sh.

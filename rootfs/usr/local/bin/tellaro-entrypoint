@@ -3,7 +3,9 @@
 #
 #   1. key pair + CSR, in the container only (tellaro-gpu-bootstrap keygen)
 #   2. redeem the single-use token for certs, secrets and the launch profile
-#      (tellaro-gpu-bootstrap redeem)  <-- STUB until tellaro-backend#3047 (B3)
+#      (tellaro-gpu-bootstrap redeem; wire contract: tellaro-backend#3047, B3).
+#      A refusal (or the token's 30 min TTL running out) exits 78; a bad
+#      answer exits 1. Either way nothing has started listening.
 #   3. start the bootstrap helper (127.0.0.1:8001), vLLM (127.0.0.1:8000), then
 #      Caddy (:8443, mTLS). If any of them exits, the container exits, and the
 #      backend's reconcile loop replaces the run.
@@ -26,8 +28,9 @@ done
 mkdir -p "$TLS_DIR" "$SECRETS_DIR" "$LAUNCH_DIR"
 
 tellaro-gpu-bootstrap keygen --out "$TLS_DIR"
-# Retries 425 with backoff; writes server.crt, client-ca.pem, secrets/* and
-# launch/vllm-args.json, or exits non-zero.
+# Retries 425/429/5xx with backoff; checks the answer against this key and run;
+# writes server.crt, client-ca.pem, secrets/* and launch/vllm-args.json, or
+# exits non-zero.
 tellaro-gpu-bootstrap redeem --tls-dir "$TLS_DIR" --secrets-dir "$SECRETS_DIR" --launch-dir "$LAUNCH_DIR"
 # The token is single-use and spent now; nothing started below inherits it.
 unset TELLARO_BOOTSTRAP_TOKEN
@@ -51,8 +54,9 @@ stop_all() {
 }
 trap 'stop_all; exit 143' TERM INT
 
+# The helper answers /_tellaro/renew and reloads Caddy over its admin socket.
 tellaro-gpu-bootstrap serve --listen 127.0.0.1:8001 --vllm "http://$VLLM_HOST:$VLLM_PORT" \
-	--tls-dir "$TLS_DIR" &
+	--tls-dir "$TLS_DIR" --caddy-admin "unix/$STATE/caddy-admin.sock" &
 pids+=("$!")
 
 # The fixed flags come last so a profile cannot move vLLM off loopback.
